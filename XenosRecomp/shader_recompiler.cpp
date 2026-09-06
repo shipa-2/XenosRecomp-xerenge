@@ -2065,7 +2065,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     }
 #endif
 
-    if (shaderContainer->definitionTableOffset != NULL)
+    if (shaderContainer->definitionTableOffset != 0)
     {
         auto definitionTable = reinterpret_cast<const DefinitionTable*>(shaderData + shaderContainer->definitionTableOffset);
         auto definitions = definitionTable->definitions;
