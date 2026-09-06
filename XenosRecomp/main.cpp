@@ -218,6 +218,14 @@ int main(int argc, char** argv)
         std::vector<uint8_t> dxil;
         std::vector<uint8_t> spirv;
         std::vector<uint8_t> air;
+        struct MicrocodeEntry
+        {
+            XXH64_hash_t microcodeHash;
+            XXH64_hash_t shaderHash;
+            uint32_t byteSize;
+            uint32_t stage;
+        };
+        std::vector<MicrocodeEntry> microcodeEntries;
 
         for (auto& [hash, shader] : shaders)
         {
@@ -232,6 +240,25 @@ int main(int argc, char** argv)
             f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, {}, {}, \"{}\" }},",
                 hash, dxil.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0,
                 spirv.size(), shader.spirv.size(), air.size(), shader.air.size(), shader.specConstantsMask, filename);
+
+            const auto container = reinterpret_cast<const ShaderContainer*>(shader.data);
+            const uint32_t containerVersion = container->flags & 0xFFFFFF00u;
+            uint32_t codeOffset = container->virtualSize;
+            uint32_t codeSize = container->physicalSize;
+            if (containerVersion == 0x102A1100u)
+            {
+                const auto shaderInfo = reinterpret_cast<const Shader*>(
+                    shader.data + container->shaderOffset);
+                codeOffset += shaderInfo->physicalOffset;
+                codeSize = shaderInfo->size;
+            }
+            if (codeSize != 0 && codeOffset <= container->virtualSize + container->physicalSize &&
+                codeSize <= container->virtualSize + container->physicalSize - codeOffset)
+            {
+                microcodeEntries.push_back({
+                    XXH3_64bits(shader.data + codeOffset, codeSize), hash, codeSize,
+                    (container->flags & 1u) != 0 ? 0u : 1u});
+            }
 
             if (shader.dxil != nullptr)
             {
@@ -248,6 +275,21 @@ int main(int argc, char** argv)
 
         f.println("}};");
         f.println("const size_t g_shaderCacheEntryCount = sizeof(g_shaderCacheEntries) / sizeof(g_shaderCacheEntries[0]);");
+
+        std::sort(microcodeEntries.begin(), microcodeEntries.end(),
+            [](const MicrocodeEntry& a, const MicrocodeEntry& b) {
+                return a.microcodeHash < b.microcodeHash;
+            });
+        microcodeEntries.erase(std::unique(microcodeEntries.begin(), microcodeEntries.end(),
+            [](const MicrocodeEntry& a, const MicrocodeEntry& b) {
+                return a.microcodeHash == b.microcodeHash;
+            }), microcodeEntries.end());
+        f.println("ShaderMicrocodeEntry g_shaderMicrocodeEntries[] = {{");
+        for (const auto& entry : microcodeEntries)
+            f.println("\t{{ 0x{:X}, 0x{:X}, {}, {} }},", entry.microcodeHash,
+                entry.shaderHash, entry.byteSize, entry.stage);
+        f.println("}};");
+        f.println("const size_t g_shaderMicrocodeEntryCount = sizeof(g_shaderMicrocodeEntries) / sizeof(g_shaderMicrocodeEntries[0]);");
 
         fmt::println("Compressing DXIL cache...");
 
@@ -297,8 +339,6 @@ int main(int argc, char** argv)
 
         f.println("const size_t g_spirvCacheCompressedSize = {};", spirvCompressed.size());
         f.println("const size_t g_spirvCacheDecompressedSize = {};", spirv.size());
-        f.println("const size_t g_shaderCacheEntryCount = {};", shaders.size());
-
         writeAllBytes(output, f.out.data(), f.out.size());
     }
     else
