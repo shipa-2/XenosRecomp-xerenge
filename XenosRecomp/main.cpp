@@ -247,6 +247,7 @@ int main(int argc, char** argv)
         }
 
         f.println("}};");
+        f.println("const size_t g_shaderCacheEntryCount = sizeof(g_shaderCacheEntries) / sizeof(g_shaderCacheEntries[0]);");
 
         fmt::println("Compressing DXIL cache...");
 
