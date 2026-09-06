@@ -1955,7 +1955,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             print("\tfloat4 o{} : {};\n", shaderInterpolatorNames[i], shaderInterpolatorSemantics[i]);
         }
 
-        for (uint32_t i = 0; i < 64; ++i)
+        // Some legacy metadata omits outputs that the microcode writes, so a
+        // broad signature is still needed for independently compiled stages.
+        // Xenos exposes 16 interpolator registers; declaring 64 here exceeded
+        // Vulkan vertex-output limits without representing real hardware.
+        for (uint32_t i = 0; i < 16; ++i)
         {
             const std::string name = fmt::format("TexCoord{}", i);
             if (std::find(shaderInterpolatorNames.begin(), shaderInterpolatorNames.end(), name) == shaderInterpolatorNames.end())
