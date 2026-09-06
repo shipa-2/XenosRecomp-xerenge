@@ -44,6 +44,7 @@ void recompileShader(RecompiledShader& shader, const std::string_view include, s
     recompiler = {};
     recompiler.recompile(shader.data, include);
 
+
     shader.specConstantsMask = recompiler.specConstantsMask;
 
     thread_local DxcCompiler dxcCompiler;
@@ -114,6 +115,9 @@ int main(int argc, char** argv)
         std::vector<std::unique_ptr<uint8_t[]>> files;
         std::map<XXH64_hash_t, RecompiledShader> shaders;
         std::map<XXH64_hash_t, std::string> shaderFilenames;
+        uint32_t rawShaderContainers = 0;
+        uint32_t rawPixelShaders = 0;
+        uint32_t rawVertexShaders = 0;
 
         for (auto& file : std::filesystem::recursive_directory_iterator(input))
         {
@@ -131,11 +135,20 @@ int main(int argc, char** argv)
                 auto shaderContainer = reinterpret_cast<const ShaderContainer*>(fileData.get() + i);
                 size_t dataSize = shaderContainer->virtualSize + shaderContainer->physicalSize;
 
-                if ((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100 &&
-                    dataSize <= (fileSize - i) &&
-                    shaderContainer->field1C == 0 &&
-                    shaderContainer->field20 == 0)
+                // Burnout Revenge uses the earlier 0x0E shader container
+                // version; newer games commonly use 0x11.
+                uint32_t containerVersion = shaderContainer->flags & 0xFFFFFF00;
+                bool isLegacyContainer = containerVersion == 0x102A0E00;
+                bool hasExpectedTrailer = isLegacyContainer ||
+                    (shaderContainer->field1C == 0 && shaderContainer->field20 == 0);
+                if ((isLegacyContainer || containerVersion == 0x102A1100) &&
+                    dataSize <= (fileSize - i) && hasExpectedTrailer)
                 {
+                    ++rawShaderContainers;
+                    if ((shaderContainer->flags & 1) == 0)
+                        ++rawPixelShaders;
+                    else
+                        ++rawVertexShaders;
                     XXH64_hash_t hash = XXH3_64bits(shaderContainer, dataSize);
                     auto shader = shaders.try_emplace(hash);
                     if (shader.second)
@@ -165,6 +178,8 @@ int main(int argc, char** argv)
         }
 
         const uint32_t numThreads = std::max(std::thread::hardware_concurrency(), 1u);
+        fmt::println("Found {} raw shader containers ({} pixel, {} vertex), {} unique shaders",
+            rawShaderContainers, rawPixelShaders, rawVertexShaders, shaders.size());
         fmt::println("Recompiling shaders with {} threads", numThreads);
 
         std::atomic<uint32_t> progress = 0;

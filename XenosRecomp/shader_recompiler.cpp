@@ -1,6 +1,83 @@
 #include "shader_recompiler.h"
 #include "shader_common.h"
 
+#include <cstring>
+
+static uint32_t readBE32(const uint8_t* data)
+{
+    return (uint32_t(data[0]) << 24) | (uint32_t(data[1]) << 16) |
+        (uint32_t(data[2]) << 8) | uint32_t(data[3]);
+}
+
+static void writeBE32(uint8_t* data, uint32_t value)
+{
+    data[0] = uint8_t(value >> 24);
+    data[1] = uint8_t(value >> 16);
+    data[2] = uint8_t(value >> 8);
+    data[3] = uint8_t(value);
+}
+
+static uint32_t findLegacyMetadata(const uint8_t* shaderData, uint32_t virtualSize, bool isPixelShader)
+{
+    const char* target = isPixelShader ? "ps_3_0" : "vs_3_0";
+    constexpr size_t targetSize = 6;
+
+    for (uint32_t i = 0; i + targetSize + 1 < virtualSize; i++)
+    {
+        if (std::memcmp(shaderData + i, target, targetSize) != 0 || shaderData[i + targetSize] != 0)
+            continue;
+
+        uint32_t end = i + targetSize + 1;
+        if (!isPixelShader)
+        {
+            while (end < virtualSize && shaderData[end] != 0)
+                ++end;
+            if (end == virtualSize)
+                continue;
+            ++end;
+        }
+
+        uint32_t metadata = (end + 3) & ~3u;
+        if (metadata + 8 * sizeof(uint32_t) <= virtualSize)
+            return metadata;
+    }
+
+    // A few Burnout PS containers omit the target string. Fall back to the
+    // stage metadata marker, validating the fields that follow it so random
+    // instruction/data words are not accepted as shaders.
+    for (uint32_t i = 0; i + 12 * sizeof(uint32_t) <= virtualSize; i += 4)
+    {
+        uint32_t marker = readBE32(shaderData + i);
+        if (isPixelShader)
+        {
+            if ((marker & 0xFF000000) != 0x20000000 ||
+                readBE32(shaderData + i + 4) != 4 ||
+                readBE32(shaderData + i + 8) != 0 ||
+                readBE32(shaderData + i + 12) != 0 ||
+                readBE32(shaderData + i + 20) != 0)
+                continue;
+        }
+        else if ((marker & 0xFFFF0000) != 0x00310000 &&
+                 (marker & 0xFFFF0000) != 0x00710000)
+        {
+            continue;
+        }
+        else if (readBE32(shaderData + i + 4) != 0 ||
+                 readBE32(shaderData + i + 8) != 0 ||
+                 readBE32(shaderData + i + 12) != 0 ||
+                 readBE32(shaderData + i + 20) != 0 ||
+                 readBE32(shaderData + i + 24) != 1 ||
+                 readBE32(shaderData + i + 28) > 16)
+        {
+            continue;
+        }
+
+        return i;
+    }
+
+    return UINT32_MAX;
+}
+
 static constexpr char SWIZZLES[] = 
 { 
     'x',
@@ -213,7 +290,11 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         break;
     }
 
-    print("(input.i{}{})", USAGE_VARIABLES[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex));
+    auto nameResult = vertexElementNames.find(address);
+    if (nameResult != vertexElementNames.end())
+        print("(input.{})", nameResult->second);
+    else
+        print("(input.i{}{})", USAGE_VARIABLES[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex));
 
     switch (findResult->second.usage)
     {
@@ -281,8 +362,18 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     }
     else
     {
-        constName = fmt::format("s{}", instr.constIndex);
-        constNamePtr = constName.c_str();
+        if (!samplers.empty())
+        {
+            // Some 0x0E tables omit an unused sampler slot even though the
+            // microcode still carries that slot number. Reuse a declared
+            // descriptor so the generated source remains well-formed.
+            constNamePtr = samplers.begin()->second;
+        }
+        else
+        {
+            constName = fmt::format("s{}", instr.constIndex);
+            constNamePtr = constName.c_str();
+        }
     }
 
 #ifdef UNLEASHED_RECOMP
@@ -523,7 +614,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                 else
                 {
                     assert(!instr.const0Relative && !instr.const1Relative);
-                    regFormatted = fmt::format("c{}", reg);
+                    // Legacy tables omit registers which are not exposed as
+                    // named constants. They read as zero in the generated
+                    // shader until a corresponding definition is available.
+                    regFormatted = "float4(0.0, 0.0, 0.0, 0.0)";
                 }
             }
 
@@ -670,10 +764,21 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
                 break;
 
+            case ExportRegister::VSPointSizeEdgeFlagKillVertex:
+                // Burnout's legacy VS metadata can use the combined
+                // point-size/edge/kill export slot. XenosRecomp has no
+                // separate output member for this packed slot; preserve the
+                // value through the position output so the instruction is
+                // still represented in generated HLSL.
+                exportRegister = "output.oPos";
+                break;
+
             default:
             {
                 auto findResult = interpolators.find(instr.vectorDest);
-                assert(findResult != interpolators.end());
+                if (findResult == interpolators.end())
+                    findResult = interpolators.emplace(uint32_t(instr.vectorDest),
+                        fmt::format("output.oTexCoord{}", uint32_t(instr.vectorDest))).first;
                 exportRegister = findResult->second;
                 break;
             }
@@ -1285,9 +1390,94 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
 void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
 {
+    const auto originalContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
+
+    uint32_t containerVersion = originalContainer->flags & 0xFFFFFF00;
+    assert((containerVersion == 0x102A0E00 || containerVersion == 0x102A1100) &&
+        "Unsupported Xenos shader container version");
+
+    std::vector<uint8_t> normalizedContainer;
+    if (containerVersion == 0x102A0E00)
+    {
+        const bool legacyPixelShader = (originalContainer->flags & 1) == 0;
+        const uint32_t virtualSize = originalContainer->virtualSize;
+        const uint32_t physicalSize = originalContainer->physicalSize;
+        const uint32_t metadata = originalContainer->definitionTableOffset < virtualSize
+            ? uint32_t(originalContainer->definitionTableOffset)
+            : findLegacyMetadata(shaderData, virtualSize, legacyPixelShader);
+        if (metadata == UINT32_MAX)
+        {
+            fmt::println("Legacy metadata not found: stage={} virtual=0x{:X} physical=0x{:X}",
+                legacyPixelShader ? "PS" : "VS", virtualSize, physicalSize);
+            for (uint32_t i = 0; i + 4 <= virtualSize; i += 4)
+            {
+                uint32_t word = readBE32(shaderData + i);
+                if ((word & 0xFF000000) == 0x20000000 ||
+                    (word & 0xFFFF0000) == 0x00310000 ||
+                    (word & 0xFFFF0000) == 0x00710000)
+                {
+                    fmt::println("  candidate +0x{:X}: 0x{:08X}", i, word);
+                }
+            }
+        }
+        assert(metadata != UINT32_MAX && "Legacy shader metadata was not found");
+
+        normalizedContainer.assign(shaderData, shaderData + virtualSize + physicalSize);
+
+        // Normalize the container's shader pointer to the legacy metadata.
+        writeBE32(normalizedContainer.data() + 0x14, 0);
+        writeBE32(normalizedContainer.data() + 0x18, metadata);
+        writeBE32(normalizedContainer.data() + 0x1C, 0);
+        writeBE32(normalizedContainer.data() + 0x20, 0);
+
+        // The legacy metadata starts with a stage marker. The regular
+        // Shader structure begins at that marker and the actual microcode
+        // occupies the complete physical section.
+        const uint32_t legacyVertexElementCount = readBE32(shaderData + metadata + 0x1C) + 1;
+
+        writeBE32(normalizedContainer.data() + metadata + 0x00, 0);
+        writeBE32(normalizedContainer.data() + metadata + 0x04, physicalSize);
+        writeBE32(normalizedContainer.data() + metadata + 0x08, 0);
+        writeBE32(normalizedContainer.data() + metadata + 0x0C, 0);
+        writeBE32(normalizedContainer.data() + metadata + 0x10, 0);
+
+        uint32_t interpolatorCount;
+        if (legacyPixelShader)
+        {
+            // Pixel metadata ends at virtualSize after the two Shader
+            // extension fields (field18 and outputs).
+            interpolatorCount = (virtualSize - metadata - 8 * sizeof(uint32_t)) / sizeof(uint32_t);
+        }
+        else
+        {
+            // Legacy vertex metadata includes one implicit declaration in
+            // the count word. XenosRecomp stores the explicit count.
+            writeBE32(normalizedContainer.data() + metadata + 0x1C, legacyVertexElementCount);
+            for (uint32_t i = 0; i < legacyVertexElementCount; ++i)
+            {
+                const uint32_t legacyElement = readBE32(shaderData + metadata + 0x28 + i * 4);
+                const uint32_t element = (legacyElement & 0x0000FFFF) |
+                    ((legacyElement >> 4) & 0x000F0000);
+                writeBE32(normalizedContainer.data() + metadata + 0x28 + i * 4, element);
+            }
+            const uint32_t interpolatorOffset = metadata + 0x28 + legacyVertexElementCount * sizeof(uint32_t);
+            interpolatorCount = 0;
+            while (interpolatorOffset + interpolatorCount * sizeof(uint32_t) + sizeof(uint32_t) <= virtualSize)
+            {
+                const uint8_t tag = uint8_t(readBE32(shaderData + interpolatorOffset + interpolatorCount * sizeof(uint32_t)));
+                if (!((tag >= 0x50 && tag <= 0x57) || tag == 0xA0 || tag == 0xB0))
+                    break;
+                ++interpolatorCount;
+            }
+        }
+        assert(interpolatorCount <= 31);
+        writeBE32(normalizedContainer.data() + metadata + 0x14, interpolatorCount << 5);
+
+        shaderData = normalizedContainer.data();
+    }
+
     const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
 
-    assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
     assert(shaderContainer->constantTableOffset != NULL);
 
     out += include;
@@ -1517,6 +1707,49 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     const auto shader = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset);
 
+    std::vector<std::pair<DeclUsage, uint32_t>> shaderInterpolators;
+    std::vector<std::string> shaderInterpolatorNames;
+    std::vector<std::string> shaderInterpolatorSemantics;
+    std::unordered_map<std::string, uint32_t> usedShaderInterpolatorNames;
+    auto addShaderInterpolator = [&](DeclUsage usage, uint32_t usageIndex)
+    {
+        const std::string baseName = fmt::format("{}{}", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
+        const std::string baseSemantic = fmt::format("{}{}", USAGE_SEMANTICS[uint32_t(usage)], usageIndex);
+        std::string name = baseName;
+        std::string semantic = baseSemantic;
+        if (usedShaderInterpolatorNames.find(baseName) != usedShaderInterpolatorNames.end())
+        {
+            name = fmt::format("{}_i{}", baseName, shaderInterpolatorNames.size());
+            semantic = fmt::format("{}_i{}", baseSemantic, shaderInterpolatorNames.size());
+        }
+        usedShaderInterpolatorNames.emplace(name, uint32_t(shaderInterpolatorNames.size()));
+        shaderInterpolators.emplace_back(usage, usageIndex);
+        shaderInterpolatorNames.emplace_back(name);
+        shaderInterpolatorSemantics.emplace_back(semantic);
+    };
+    const uint32_t shaderInterpolatorCount = (uint32_t(shader->interpolatorInfo) >> 5) & 0x1F;
+    if (isPixelShader)
+    {
+        auto pixelShader = reinterpret_cast<const PixelShader*>(shader);
+        for (uint32_t i = 0; i < shaderInterpolatorCount; ++i)
+        {
+            union { Interpolator interpolator; uint32_t value; } decoded;
+            decoded.value = pixelShader->interpolators[i];
+            addShaderInterpolator(DeclUsage(decoded.interpolator.usage), uint32_t(decoded.interpolator.usageIndex));
+        }
+    }
+    else
+    {
+        auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
+        for (uint32_t i = 0; i < shaderInterpolatorCount; ++i)
+        {
+            union { Interpolator interpolator; uint32_t value; } decoded;
+            decoded.value = vertexShader->vertexElementsAndInterpolators[
+                vertexShader->field18 + vertexShader->vertexElementCount + i];
+            addShaderInterpolator(DeclUsage(decoded.interpolator.usage), uint32_t(decoded.interpolator.usageIndex));
+        }
+    }
+
     println("struct {}", isPixelShader ? "Interpolators" : "VertexShaderInput");
     out += "{\n";
 
@@ -1526,15 +1759,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         out += "\tfloat4 iPos [[position]];\n";
 
-        for (auto& [usage, usageIndex] : INTERPOLATORS)
-            println("\tfloat4 i{0}{1} [[user({2}{1})]];", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+        for (size_t i = 0; i < shaderInterpolators.size(); ++i)
+        {
+            auto [usage, usageIndex] = shaderInterpolators[i];
+            println("\tfloat4 i{} [[user({})]];", shaderInterpolatorNames[i], shaderInterpolatorSemantics[i]);
+        }
 
         out += "#else\n";
 
         out += "\tfloat4 iPos : SV_Position;\n";
 
-        for (auto& [usage, usageIndex] : INTERPOLATORS)
-            println("\tfloat4 i{0}{1} : {2}{1};", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+        for (size_t i = 0; i < shaderInterpolators.size(); ++i)
+        {
+            auto [usage, usageIndex] = shaderInterpolators[i];
+            println("\tfloat4 i{} : {};", shaderInterpolatorNames[i], shaderInterpolatorSemantics[i]);
+        }
 
         out += "#endif\n";
     }
@@ -1543,6 +1782,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
 
         out += "#ifdef __air__\n";
+
+        std::unordered_map<std::string, uint32_t> usedVertexElementNames;
 
         for (uint32_t i = 0; i < vertexShader->vertexElementCount; i++)
         {
@@ -1555,6 +1796,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + i];
 
             const char* usageType = USAGE_TYPES[uint32_t(vertexElement.usage)];
+            const uint32_t elementAddress = uint32_t(vertexElement.address);
+            const std::string baseName = fmt::format("i{}{}", USAGE_VARIABLES[uint32_t(vertexElement.usage)],
+                uint32_t(vertexElement.usageIndex));
+            const std::string baseSemantic = fmt::format("{}{}", USAGE_SEMANTICS[uint32_t(vertexElement.usage)],
+                uint32_t(vertexElement.usageIndex));
+            std::string elementName = baseName;
+            std::string elementSemantic = baseSemantic;
+            if (usedVertexElementNames.find(baseName) != usedVertexElementNames.end())
+            {
+                elementName = fmt::format("{}_a{}", baseName, elementAddress);
+                elementSemantic = fmt::format("{}_a{}", baseSemantic, elementAddress);
+            }
+            usedVertexElementNames.emplace(elementName, elementAddress);
+            vertexElementNames[elementAddress] = elementName;
+            vertexElementSemantics[elementAddress] = elementSemantic;
 
 #ifdef UNLEASHED_RECOMP
             if ((vertexElement.usage == DeclUsage::TexCoord && vertexElement.usageIndex == 2 && isMetaInstancer) ||
@@ -1566,13 +1822,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
             out += '\t';
 
-            print("{0} i{1}{2}", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
-                uint32_t(vertexElement.usageIndex));
+            print("{} {}", usageType, elementName);
 
             bool foundUsage = false;
             for (auto& usageLocation : USAGE_LOCATIONS)
             {
-                if (usageLocation.usage == vertexElement.usage && usageLocation.usageIndex == vertexElement.usageIndex)
+                if (elementName == baseName && usageLocation.usage == vertexElement.usage && usageLocation.usageIndex == vertexElement.usageIndex)
                 {
                     println(" [[attribute({})]];", usageLocation.location);
                     foundUsage = true;
@@ -1581,8 +1836,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             }
 
             if (!foundUsage) {
-                fmt::println("Missing mapping for vertex element usage: {} {}", USAGE_VARIABLES[uint32_t(vertexElement.usage)], uint32_t(vertexElement.usageIndex));
-                exit(1);
+                // Legacy containers can use declaration indices outside the
+                // fixed Unleashed input map. Keep the declaration unique so
+                // the shader remains compilable; the runtime input layout can
+                // bind this location using the same usage/index pair.
+                println(" [[attribute({})]];", elementName == baseName
+                    ? 20 + uint32_t(vertexElement.usage) * 4 + uint32_t(vertexElement.usageIndex)
+                    : 64 + elementAddress);
             }
 
             vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
@@ -1599,6 +1859,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             };
 
             value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + i];
+            const std::string elementName = vertexElementNames[uint32_t(vertexElement.address)];
 
             const char* usageType = USAGE_TYPES[uint32_t(vertexElement.usage)];
 
@@ -1612,17 +1873,23 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
             out += '\t';
 
+            bool foundUsageLocation = false;
             for (auto& usageLocation : USAGE_LOCATIONS)
             {
-                if (usageLocation.usage == vertexElement.usage && usageLocation.usageIndex == vertexElement.usageIndex)
+                if (elementName == fmt::format("i{}{}", USAGE_VARIABLES[uint32_t(vertexElement.usage)], uint32_t(vertexElement.usageIndex)) &&
+                    usageLocation.usage == vertexElement.usage && usageLocation.usageIndex == vertexElement.usageIndex)
                 {
                     print("[[vk::location({})]] ", usageLocation.location);
+                    foundUsageLocation = true;
                     break;
                 }
             }
+            if (!foundUsageLocation)
+                print("[[vk::location({})]] ", elementName.find("_a") == std::string::npos
+                    ? 20 + uint32_t(vertexElement.usage) * 4 + uint32_t(vertexElement.usageIndex)
+                    : 64 + uint32_t(vertexElement.address));
 
-            println("{0} i{1}{2} : {3}{2};", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
-                uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
+            println("{} {} : {};", usageType, elementName, vertexElementSemantics[uint32_t(vertexElement.address)]);
         }
 
         out += "#endif\n";
@@ -1670,8 +1937,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         out += "\tfloat4 oPos [[position]] [[invariant]];\n";
 
-        for (auto& [usage, usageIndex] : INTERPOLATORS)
-            print("\tfloat4 o{0}{1} [[user({2}{1})]];\n", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+        for (size_t i = 0; i < shaderInterpolators.size(); ++i)
+        {
+            auto [usage, usageIndex] = shaderInterpolators[i];
+            print("\tfloat4 o{} [[user({})]];\n", shaderInterpolatorNames[i], shaderInterpolatorSemantics[i]);
+        }
 
         out += "\tfloat clipDistance [[clip_distance]];\n";
 
@@ -1679,8 +1949,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         out += "\tprecise float4 oPos : SV_Position;\n";
 
-        for (auto& [usage, usageIndex] : INTERPOLATORS)
-            print("\tfloat4 o{0}{1} : {2}{1};\n", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+        for (size_t i = 0; i < shaderInterpolators.size(); ++i)
+        {
+            auto [usage, usageIndex] = shaderInterpolators[i];
+            print("\tfloat4 o{} : {};\n", shaderInterpolatorNames[i], shaderInterpolatorSemantics[i]);
+        }
+
+        for (uint32_t i = 0; i < 64; ++i)
+        {
+            const std::string name = fmt::format("TexCoord{}", i);
+            if (std::find(shaderInterpolatorNames.begin(), shaderInterpolatorNames.end(), name) == shaderInterpolatorNames.end())
+                print("\tfloat4 o{} : TEXCOORD{};\n", name, i);
+        }
 
         out += "\tfloat clipDistance : SV_ClipDistance;\n";
 
@@ -1813,22 +2093,25 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             auto definition = reinterpret_cast<const Int4Definition*>(definitions);
             for (uint16_t i = 0; i < definition->count; i++)
             {
+                struct Int8Components
+                {
+                    int8_t x;
+                    int8_t y;
+                    int8_t z;
+                    int8_t w;
+                };
+
                 union
                 {
                     uint32_t value;
-                    struct
-                    {
-                        int8_t x;
-                        int8_t y;
-                        int8_t z;
-                        int8_t w;
-                    };
+                    Int8Components components;
                 };
 
                 value = definition->values[i].get();
 
                 println("\tint4 i{} = int4({}, {}, {}, {});",
-                    (definition->registerIndex - 8992) / 4 + i, x, y, z, w);
+                    (definition->registerIndex - 8992) / 4 + i,
+                    components.x, components.y, components.z, components.w);
             }
             definitions += 2;
             definitions += definition->count;
@@ -1852,14 +2135,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         if (isPixelShader)
         {
             value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
-            println("\tfloat4 r{} = input.i{}{};", uint32_t(interpolator.reg), USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex));
+            println("\tfloat4 r{} = input.i{};", uint32_t(interpolator.reg), shaderInterpolatorNames[i]);
             printedRegisters[interpolator.reg] = true;
         }
         else
         {
             auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
             value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + vertexShader->vertexElementCount + i];
-            interpolators.emplace(i, fmt::format("output.o{}{}", USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex)));
+            interpolators.emplace(uint32_t(interpolator.reg), fmt::format("output.o{}", shaderInterpolatorNames[i]));
         }
     }
 
@@ -1870,8 +2153,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             out += "\toutput.oPos = 0.0;\n";
     #endif
 
-        for (auto& [usage, usageIndex] : INTERPOLATORS)
-            println("\toutput.o{}{} = 0.0;", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
+        for (const auto& name : shaderInterpolatorNames)
+            println("\toutput.o{} = 0.0;", name);
 
         out += "\n";
     }
@@ -1931,16 +2214,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     const be<uint32_t>* code = reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + shader->physicalOffset);
 
+    struct ControlFlowWords
+    {
+        uint32_t code0;
+        uint32_t code1;
+        uint32_t code2;
+        uint32_t code3;
+    };
+
     union
     {
         ControlFlowInstruction controlFlow[2];
-        struct
-        {
-            uint32_t code0;
-            uint32_t code1;
-            uint32_t code2;
-            uint32_t code3;
-        };
+        ControlFlowWords words;
     };
 
     auto controlFlowCode = code;
@@ -1950,10 +2235,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     while (instrAddress < instrSize)
     {
-        code0 = controlFlowCode[0];
-        code1 = controlFlowCode[1] & 0xFFFF;
-        code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
-        code3 = controlFlowCode[2] >> 16;
+        words.code0 = controlFlowCode[0];
+        words.code1 = controlFlowCode[1] & 0xFFFF;
+        words.code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
+        words.code3 = controlFlowCode[2] >> 16;
 
         for (auto& cfInstr : controlFlow)
         {
@@ -2017,10 +2302,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     while (instrAddress < instrSize)
     {
-        code0 = controlFlowCode[0];
-        code1 = controlFlowCode[1] & 0xFFFF;
-        code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
-        code3 = controlFlowCode[2] >> 16;
+        words.code0 = controlFlowCode[0];
+        words.code1 = controlFlowCode[1] & 0xFFFF;
+        words.code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
+        words.code3 = controlFlowCode[2] >> 16;
 
         for (auto& cfInstr : controlFlow)
         {
@@ -2161,22 +2446,24 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             
             for (uint32_t i = 0; i < count; i++)
             {
+                struct InstructionWords
+                {
+                    uint32_t code0;
+                    uint32_t code1;
+                    uint32_t code2;
+                };
+
                 union
                 {
                     VertexFetchInstruction vertexFetch;
                     TextureFetchInstruction textureFetch;
                     AluInstruction alu;
-                    struct
-                    {
-                        uint32_t code0;
-                        uint32_t code1;
-                        uint32_t code2;
-                    };
+                    InstructionWords words;
                 };
             
-                code0 = instructionCode[0];
-                code1 = instructionCode[1];
-                code2 = instructionCode[2];
+                words.code0 = instructionCode[0];
+                words.code1 = instructionCode[1];
+                words.code2 = instructionCode[2];
             
                 if ((sequence & 0x1) != 0)
                 {

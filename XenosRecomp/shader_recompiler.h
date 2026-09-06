@@ -27,6 +27,8 @@ struct ShaderRecompiler : StringBuffer
     bool isPixelShader = false;
     const uint8_t* constantTableData = nullptr;
     std::unordered_map<uint32_t, VertexElement> vertexElements;
+    std::unordered_map<uint32_t, std::string> vertexElementNames;
+    std::unordered_map<uint32_t, std::string> vertexElementSemantics;
     std::unordered_map<uint32_t, std::string> interpolators;
     std::unordered_map<uint32_t, const ConstantInfo*> float4Constants;
     std::unordered_map<uint32_t, const char*> boolConstants;

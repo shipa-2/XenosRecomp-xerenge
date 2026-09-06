@@ -301,21 +301,21 @@ uint3 getTexture2DArrayDimensions(Texture2DArray<float4> texture)
 float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
+    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), 0.0);
 }
 
 float4 tfetch2DArray(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
 {
     Texture2DArray<float4> texture = g_Texture2DArrayDescriptorHeap[resourceDescriptorIndex];
     uint3 dimensions = getTexture2DArrayDimensions(texture);
-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z));
+    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z), 0.0);
 }
 
 float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
 {
     float3 dir = cubeDir(texCoord);
-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(
-        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir);
+    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(
+        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, 0.0);
 }
 
 float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
