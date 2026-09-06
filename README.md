@@ -115,6 +115,24 @@ At runtime, shaders are mapped to their recompiled versions using a 64-bit XXH3 
 
 SPIR-V shaders are compressed using smol-v to improve zstd compression efficiency, while DXIL shaders are compressed as-is.
 
+### Xerenge legacy Xbox 360 containers
+
+The `XenosRecomp-xerenge` fork also accepts the legacy Xbox 360 shader container
+variant used by some early titles. These containers use the `0x102A0E00` and
+`0x102A0E01` stage flags instead of the newer `0x102A1100` format. The
+recompiler normalizes their metadata in memory, reconstructs vertex declarations
+and interpolator names, and then sends the resulting shader through the normal
+DXC and SPIR-V pipeline.
+
+The input may be a single binary or a directory containing binaries. Generated
+HLSL and shader cache files are validation outputs and should remain outside the
+repository. Do not commit game images, XEX files, extracted data, or generated
+cache sources.
+
+The current validation target is Burnout Revenge Beta. A successful run reports
+64 pixel and 67 vertex containers, 119 unique shaders, and exits with status 0.
+Runtime rendering validation in a native port is still a separate step.
+
 ## Building
 
 The project requires CMake 3.20 and a C++ compiler with C++17 support to build. While compilers other than Clang might work, they have not been tested. Since the repository includes submodules, ensure you clone it recursively.

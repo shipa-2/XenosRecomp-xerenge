@@ -397,3 +397,12 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# Xerenge local inputs and generated shader outputs
+build-debug/
+build/
+extract/
+work/
+*.iso
+*.xex
+*_shader_cache*.cpp
