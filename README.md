@@ -124,7 +124,8 @@ recompiler normalizes their metadata in memory, reconstructs vertex declarations
 and interpolator names, and then sends the resulting shader through the normal
 DXC and SPIR-V pipeline.
 
-The input may be a single binary or a directory containing binaries. Generated
+The cache mode expects a directory containing binaries. The direct conversion
+mode still accepts one standalone shader container. Generated
 HLSL and shader cache files are validation outputs and should remain outside the
 repository. Do not commit game images, XEX files, extracted data, or generated
 cache sources.
