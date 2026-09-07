@@ -269,6 +269,10 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         print("(float{})(", size);
 
     auto findResult = vertexElements.find(address);
+    if (findResult == vertexElements.end())
+        fmt::println(stderr,
+            "Missing vertex declaration for vfetch address {} (format {}, register r{})",
+            address, uint32_t(instr.format), instr.dstRegister);
     assert(findResult != vertexElements.end());
 
     switch (findResult->second.usage)
