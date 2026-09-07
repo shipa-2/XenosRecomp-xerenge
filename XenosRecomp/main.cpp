@@ -44,6 +44,17 @@ void recompileShader(RecompiledShader& shader, const std::string_view include, s
     recompiler = {};
     recompiler.recompile(shader.data, include);
 
+    if (const char* dumpDirectory = std::getenv("XENOS_RECOMP_DUMP_SOURCE_DIR"))
+    {
+        const auto* container = reinterpret_cast<const ShaderContainer*>(shader.data);
+        const size_t containerSize = container->virtualSize + container->physicalSize;
+        const uint64_t hash = XXH3_64bits(shader.data, containerSize);
+        std::filesystem::create_directories(dumpDirectory);
+        const auto path = std::filesystem::path(dumpDirectory) /
+            fmt::format("{:016x}.hlsl", hash);
+        writeAllBytes(path.string().c_str(), recompiler.out.data(), recompiler.out.size());
+    }
+
 
     shader.specConstantsMask = recompiler.specConstantsMask;
 
