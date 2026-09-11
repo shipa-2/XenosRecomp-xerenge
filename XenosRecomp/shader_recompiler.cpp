@@ -1888,10 +1888,24 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     break;
                 }
             }
+            // Vulkan requires every vertex input location to be below
+            // maxVertexInputAttributes, which is 32 on common desktop
+            // hardware (AMD RADV reports exactly 32). The original fallbacks
+            // could reach 20 + usage*4 + index or 64 + address, both of which
+            // overshoot that and make the pipeline impossible to create -
+            // reported as VUID-VkVertexInputAttributeDescription-location-00620,
+            // after which nothing the shader draws can appear. Keep both
+            // fallbacks inside the guaranteed range, above the 0..19 the
+            // USAGE_LOCATIONS table occupies.
             if (!foundUsageLocation)
-                print("[[vk::location({})]] ", elementName.find("_a") == std::string::npos
-                    ? 20 + uint32_t(vertexElement.usage) * 4 + uint32_t(vertexElement.usageIndex)
-                    : 64 + uint32_t(vertexElement.address));
+            {
+                constexpr uint32_t fallbackBase = 20;
+                constexpr uint32_t fallbackSlots = 12; // 20..31
+                const uint32_t fallback = elementName.find("_a") == std::string::npos
+                    ? uint32_t(vertexElement.usage) * 4 + uint32_t(vertexElement.usageIndex)
+                    : uint32_t(vertexElement.address);
+                print("[[vk::location({})]] ", fallbackBase + (fallback % fallbackSlots));
+            }
 
             println("{} {} : {};", usageType, elementName, vertexElementSemantics[uint32_t(vertexElement.address)]);
         }
