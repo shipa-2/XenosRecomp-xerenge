@@ -35,6 +35,10 @@ struct ShaderRecompiler : StringBuffer
     std::unordered_map<uint32_t, const char*> samplers;
     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
     uint32_t specConstantsMask = 0;
+    // A vertex shader that builds its own instancing out of the index Xenos
+    // puts in r0.x (Burnout's gNumVertices shaders). The host hands that index
+    // in as an input, since what it draws is already expanded.
+    bool guestIndexInput = false;
 
 #ifdef UNLEASHED_RECOMP
     bool hasMtxProjection = false;

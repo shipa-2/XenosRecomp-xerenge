@@ -308,7 +308,18 @@ float4 tfetch2DArray(uint resourceDescriptorIndex, uint samplerDescriptorIndex, 
 {
     Texture2DArray<float4> texture = g_Texture2DArrayDescriptorHeap[resourceDescriptorIndex];
     uint3 dimensions = getTexture2DArrayDimensions(texture);
-    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z), 0.0);
+    // A volume texture filters between its slices; an array picks one. Blend
+    // the two slices around the coordinate, texel-centred, as a 3D fetch does -
+    // a colour grading table read one slice at a time bands, and a sky's
+    // gradient shows it as its colour jumping.
+    float2 uv = texCoord.xy + offset.xy / dimensions.xy;
+    float layer = texCoord.z * dimensions.z - 0.5;
+    float base = floor(layer);
+    float t = layer - base;
+    float last = float(dimensions.z) - 1.0;
+    float4 a = texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(uv, clamp(base, 0.0, last)), 0.0);
+    float4 b = texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(uv, clamp(base + 1.0, 0.0, last)), 0.0);
+    return lerp(a, b, t);
 }
 
 float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)

@@ -1,6 +1,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <atomic>
 
 #include "shader.h"
 #include "shader_recompiler.h"
@@ -38,7 +39,8 @@ struct RecompiledShader
     uint32_t specConstantsMask = 0;
 };
 
-void recompileShader(RecompiledShader& shader, const std::string_view include, std::atomic<uint32_t>& progress, uint32_t numShaders)
+static bool recompileShader(RecompiledShader& shader, const std::string_view include,
+    std::atomic<uint32_t>& progress, uint32_t numShaders, XXH64_hash_t shaderHash)
 {
     thread_local ShaderRecompiler recompiler;
     recompiler = {};
@@ -55,14 +57,17 @@ void recompileShader(RecompiledShader& shader, const std::string_view include, s
         writeAllBytes(path.string().c_str(), recompiler.out.data(), recompiler.out.size());
     }
 
-
     shader.specConstantsMask = recompiler.specConstantsMask;
 
     thread_local DxcCompiler dxcCompiler;
 
 #ifdef XENOS_RECOMP_DXIL
     shader.dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false);
-    assert(shader.dxil != nullptr);
+    if (shader.dxil == nullptr)
+    {
+        fmt::println("DXC DXIL failed for shader {:016X}; skipping", shaderHash);
+        return false;
+    }
     assert(*(reinterpret_cast<uint32_t *>(shader.dxil->GetBufferPointer()) + 1) != 0 && "DXIL was not signed properly!");
 #endif
 
@@ -71,16 +76,31 @@ void recompileShader(RecompiledShader& shader, const std::string_view include, s
 #endif
 
     IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
-    assert(spirv != nullptr);
+    if (spirv == nullptr)
+    {
+        fmt::println("DXC SPIR-V failed for shader {:016X}; skipping", shaderHash);
+        if (const char* dumpDirectory = std::getenv("XENOS_RECOMP_DUMP_SOURCE_DIR"))
+        {
+            const auto path = std::filesystem::path(dumpDirectory) /
+                fmt::format("{:016x}.fail.hlsl", shaderHash);
+            writeAllBytes(path.string().c_str(), recompiler.out.data(), recompiler.out.size());
+        }
+        return false;
+    }
 
     bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
-    assert(result);
-
     spirv->Release();
+    if (!result)
+    {
+        fmt::println("smol-v encode failed for shader {:016X}; skipping", shaderHash);
+        shader.spirv.clear();
+        return false;
+    }
 
     size_t currentProgress = ++progress;
     if ((currentProgress % 10) == 0 || (currentProgress == numShaders - 1))
         fmt::println("Recompiling shaders... {}%", currentProgress / float(numShaders) * 100.0f);
+    return true;
 }
 
 int main(int argc, char** argv)
@@ -211,7 +231,10 @@ int main(int argc, char** argv)
                         shaderHash = shaderQueue.front();
                         shaderQueue.pop_front();
                     }
-                    recompileShader(shaders[shaderHash], include, progress, shaders.size());
+                    if (!recompileShader(shaders[shaderHash], include, progress, shaders.size(), shaderHash))
+                    {
+                        shaders[shaderHash].spirv.clear();
+                    }
                 }
             });
         }
@@ -238,8 +261,14 @@ int main(int argc, char** argv)
         };
         std::vector<MicrocodeEntry> microcodeEntries;
 
+        uint32_t skippedShaders = 0;
         for (auto& [hash, shader] : shaders)
         {
+            if (shader.spirv.empty())
+            {
+                ++skippedShaders;
+                continue;
+            }
             const std::string& fullFilename = shaderFilenames[hash];
             std::string filename = fullFilename;
             size_t shaderPos = filename.find("shader");
@@ -351,6 +380,7 @@ int main(int argc, char** argv)
         f.println("const size_t g_spirvCacheCompressedSize = {};", spirvCompressed.size());
         f.println("const size_t g_spirvCacheDecompressedSize = {};", spirv.size());
         writeAllBytes(output, f.out.data(), f.out.size());
+        fmt::println("Wrote {} unique shaders ({} skipped)", shaders.size() - skippedShaders, skippedShaders);
     }
     else
     {

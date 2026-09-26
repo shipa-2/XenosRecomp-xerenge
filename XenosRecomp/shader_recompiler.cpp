@@ -2,6 +2,7 @@
 #include "shader_common.h"
 
 #include <cstring>
+#include <vector>
 
 static uint32_t readBE32(const uint8_t* data)
 {
@@ -94,7 +95,11 @@ static constexpr const char* USAGE_TYPES[] =
 {
     "float4", // POSITION
     "float4", // BLENDWEIGHT
-    "uint4", // BLENDINDICES
+    // float4, not uint4: the fetch hands the shader floats (normalised or not,
+    // as the instruction says), and the shaders here convert and scale them
+    // themselves. Declared uint4 against a float vertex buffer, the skinned
+    // wreck of a crashed car read garbage matrix indices.
+    "float4", // BLENDINDICES
     "float4", // NORMAL
     "float4", // PSIZE
     "float4", // TEXCOORD
@@ -619,9 +624,12 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                 {
                     assert(!instr.const0Relative && !instr.const1Relative);
                     // Legacy tables omit registers which are not exposed as
-                    // named constants. They read as zero in the generated
-                    // shader until a corresponding definition is available.
-                    regFormatted = "float4(0.0, 0.0, 0.0, 0.0)";
+                    // named constants - above all the shader's own literals,
+                    // which Direct3D loads into the bank when the shader is
+                    // set. Read as zero they zeroed every weight and scale a
+                    // shader kept there (Burnout's 3D composite came out
+                    // black); read from the bank they have their values.
+                    regFormatted = fmt::format("XENOS_RAW_CONST({})", reg);
                 }
             }
 
@@ -1494,10 +1502,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     out += "#ifdef __spirv__\n\n";
 
+    // A register the constant table does not name - the literals a shader
+    // defines, which Direct3D loads into the top of the constant bank when the
+    // shader is set - is read straight from the bank by number.
+    println("#define XENOS_RAW_CONST(N) vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + (N) * 16, 0x10)",
+        isPixelShader ? "Pixel" : "Vertex");
+
 #ifdef UNLEASHED_RECOMP
     bool isMetaInstancer = false;
     bool hasIndexCount = false;
 #endif
+    guestIndexInput = false;
 
     for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
     {
@@ -1505,6 +1520,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
 
         const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+
+        if (!isPixelShader && strcmp(constantName, "gNumVertices") == 0)
+            guestIndexInput = true;
 
     #ifdef UNLEASHED_RECOMP
         if (!isPixelShader)
@@ -1567,6 +1585,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     }
 
     out += "\n#elif defined(__air__)\n\n";
+
+    println("#define XENOS_RAW_CONST(N) (*(reinterpret_cast<device float4*>(g_PushConstants.{}ShaderConstants + (N) * 16)))",
+        isPixelShader ? "Pixel" : "Vertex");
 
     for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
     {
@@ -1636,6 +1657,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     }
 
     out += "\n#else\n\n";
+
+    out += "#define XENOS_RAW_CONST(N) float4(0.0, 0.0, 0.0, 0.0)\n";
 
     println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
     out += "{\n";
@@ -1785,9 +1808,42 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     {
         auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
 
-        out += "#ifdef __air__\n";
+        struct VertexElementEmit
+        {
+            VertexElement element{};
+            uint32_t address = 0;
+            uint32_t location = 0;
+            const char* usageType = "float4";
+            std::string name;
+            std::string semantic;
+        };
 
+        std::vector<VertexElementEmit> vertexEmits;
+        vertexEmits.reserve(vertexShader->vertexElementCount);
         std::unordered_map<std::string, uint32_t> usedVertexElementNames;
+        bool usedLocations[32]{};
+
+        auto preferredLocation = [](DeclUsage usage, uint32_t usageIndex) -> int
+        {
+            for (auto& usageLocation : USAGE_LOCATIONS)
+            {
+                if (usageLocation.usage == usage && usageLocation.usageIndex == usageIndex)
+                    return int(usageLocation.location);
+            }
+            return -1;
+        };
+
+        auto allocateLocation = [&](int preferred) -> uint32_t
+        {
+            if (preferred >= 0 && preferred < 32 && !usedLocations[preferred])
+                return uint32_t(preferred);
+            for (uint32_t location = 0; location < 32; ++location)
+            {
+                if (!usedLocations[location])
+                    return location;
+            }
+            return UINT32_MAX;
+        };
 
         for (uint32_t i = 0; i < vertexShader->vertexElementCount; i++)
         {
@@ -1799,7 +1855,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
             value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + i];
 
-            const char* usageType = USAGE_TYPES[uint32_t(vertexElement.usage)];
             const uint32_t elementAddress = uint32_t(vertexElement.address);
             const std::string baseName = fmt::format("i{}{}", USAGE_VARIABLES[uint32_t(vertexElement.usage)],
                 uint32_t(vertexElement.usageIndex));
@@ -1813,60 +1868,20 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 elementSemantic = fmt::format("{}_a{}", baseSemantic, elementAddress);
             }
             usedVertexElementNames.emplace(elementName, elementAddress);
-            vertexElementNames[elementAddress] = elementName;
-            vertexElementSemantics[elementAddress] = elementSemantic;
 
-#ifdef UNLEASHED_RECOMP
-            if ((vertexElement.usage == DeclUsage::TexCoord && vertexElement.usageIndex == 2 && isMetaInstancer) ||
-                (vertexElement.usage == DeclUsage::Position && vertexElement.usageIndex == 1))
+            const int preferred = (elementName == baseName)
+                ? preferredLocation(vertexElement.usage, uint32_t(vertexElement.usageIndex))
+                : -1;
+            const uint32_t location = allocateLocation(preferred);
+            if (location == UINT32_MAX)
             {
-                usageType = "uint4";
+                fmt::println("Vertex declaration exceeds 32 unique locations; dropping {} (address {})",
+                    elementName, elementAddress);
+                continue;
             }
-#endif
-
-            out += '\t';
-
-            print("{} {}", usageType, elementName);
-
-            bool foundUsage = false;
-            for (auto& usageLocation : USAGE_LOCATIONS)
-            {
-                if (elementName == baseName && usageLocation.usage == vertexElement.usage && usageLocation.usageIndex == vertexElement.usageIndex)
-                {
-                    println(" [[attribute({})]];", usageLocation.location);
-                    foundUsage = true;
-                    break;
-                }
-            }
-
-            if (!foundUsage) {
-                // Legacy containers can use declaration indices outside the
-                // fixed Unleashed input map. Keep the declaration unique so
-                // the shader remains compilable; the runtime input layout can
-                // bind this location using the same usage/index pair.
-                println(" [[attribute({})]];", elementName == baseName
-                    ? 20 + uint32_t(vertexElement.usage) * 4 + uint32_t(vertexElement.usageIndex)
-                    : 64 + elementAddress);
-            }
-
-            vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
-        }
-
-        out += "#else\n";
-
-        for (uint32_t i = 0; i < vertexShader->vertexElementCount; i++)
-        {
-            union
-            {
-                VertexElement vertexElement;
-                uint32_t value;
-            };
-
-            value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + i];
-            const std::string elementName = vertexElementNames[uint32_t(vertexElement.address)];
+            usedLocations[location] = true;
 
             const char* usageType = USAGE_TYPES[uint32_t(vertexElement.usage)];
-
 #ifdef UNLEASHED_RECOMP
             if ((vertexElement.usage == DeclUsage::TexCoord && vertexElement.usageIndex == 2 && isMetaInstancer) ||
                 (vertexElement.usage == DeclUsage::Position && vertexElement.usageIndex == 1))
@@ -1875,42 +1890,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             }
 #endif
 
-            out += '\t';
-
-            bool foundUsageLocation = false;
-            for (auto& usageLocation : USAGE_LOCATIONS)
-            {
-                if (elementName == fmt::format("i{}{}", USAGE_VARIABLES[uint32_t(vertexElement.usage)], uint32_t(vertexElement.usageIndex)) &&
-                    usageLocation.usage == vertexElement.usage && usageLocation.usageIndex == vertexElement.usageIndex)
-                {
-                    print("[[vk::location({})]] ", usageLocation.location);
-                    foundUsageLocation = true;
-                    break;
-                }
-            }
-            // Vulkan requires every vertex input location to be below
-            // maxVertexInputAttributes, which is 32 on common desktop
-            // hardware (AMD RADV reports exactly 32). The original fallbacks
-            // could reach 20 + usage*4 + index or 64 + address, both of which
-            // overshoot that and make the pipeline impossible to create -
-            // reported as VUID-VkVertexInputAttributeDescription-location-00620,
-            // after which nothing the shader draws can appear. Keep both
-            // fallbacks inside the guaranteed range, above the 0..19 the
-            // USAGE_LOCATIONS table occupies.
-            if (!foundUsageLocation)
-            {
-                constexpr uint32_t fallbackBase = 20;
-                constexpr uint32_t fallbackSlots = 12; // 20..31
-                const uint32_t fallback = elementName.find("_a") == std::string::npos
-                    ? uint32_t(vertexElement.usage) * 4 + uint32_t(vertexElement.usageIndex)
-                    : uint32_t(vertexElement.address);
-                print("[[vk::location({})]] ", fallbackBase + (fallback % fallbackSlots));
-            }
-
-            println("{} {} : {};", usageType, elementName, vertexElementSemantics[uint32_t(vertexElement.address)]);
+            vertexElementNames[elementAddress] = elementName;
+            vertexElementSemantics[elementAddress] = elementSemantic;
+            vertexElements.emplace(elementAddress, vertexElement);
+            vertexEmits.push_back({ vertexElement, elementAddress, location, usageType,
+                std::move(elementName), std::move(elementSemantic) });
         }
 
+        out += "#ifdef __air__\n";
+        for (const auto& emit : vertexEmits)
+            println("\t{} {} [[attribute({})]];", emit.usageType, emit.name, emit.location);
+
+        out += "#else\n";
+        for (const auto& emit : vertexEmits)
+            println("\t[[vk::location({})]] {} {} : {};", emit.location, emit.usageType, emit.name, emit.semantic);
+
         out += "#endif\n";
+
+        // Location 19 (BlendWeight0) carries the guest's vertex index for a
+        // shader that instances by it - unless the shader has a use for it.
+        if (guestIndexInput && usedLocations[19])
+            guestIndexInput = false;
+        if (guestIndexInput)
+        {
+            out += "#ifdef __air__\n";
+            out += "\tfloat4 iGuestIndex [[attribute(19)]];\n";
+            out += "#else\n";
+            out += "\t[[vk::location(19)]] float4 iGuestIndex : GUESTINDEX0;\n";
+            out += "#endif\n";
+        }
     }
 
     out += "};\n";
@@ -2189,6 +2197,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
             {
                 out += "float4((input.iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
+            }
+            else if (!isPixelShader && guestIndexInput && i == 0)
+            {
+                out += "float4(input.iGuestIndex.x, 0.0, 0.0, 0.0);\n";
             }
         #ifdef UNLEASHED_RECOMP
             else if (!isPixelShader && hasIndexCount && i == 0)
