@@ -23,13 +23,14 @@
 
 #ifdef __spirv__
 
-// The constants come in three uniform buffers in set 4, each bound per draw at
-// its own offset: plain Vulkan 1.0, where reading them through a 64-bit buffer
-// address (vk::RawBufferLoad) needed bufferDeviceAddress and shaderInt64, which
-// the stock drivers of most phones do not have.
-[[vk::binding(0, 4)]] cbuffer XenosVertexConstants { float4 g_VertexShaderConstants[256]; };
-[[vk::binding(1, 4)]] cbuffer XenosPixelConstants { float4 g_PixelShaderConstants[256]; };
-[[vk::binding(2, 4)]] cbuffer XenosSharedConstants { uint4 g_SharedConstants[32]; };
+// Everything a draw reads comes from one descriptor set (set 0), plain Vulkan
+// 1.0 - most phones' stock drivers have neither buffer device addresses with
+// 64-bit integers nor descriptor indexing. Bindings 0-2: the constants, three
+// uniform buffers bound at the draw's own offsets; 3-6: sixteen 2D, layered
+// and cube textures and sixteen samplers, the draw's sampler slots (below).
+[[vk::binding(0, 0)]] cbuffer XenosVertexConstants { float4 g_VertexShaderConstants[256]; };
+[[vk::binding(1, 0)]] cbuffer XenosPixelConstants { float4 g_PixelShaderConstants[256]; };
+[[vk::binding(2, 0)]] cbuffer XenosSharedConstants { uint4 g_SharedConstants[32]; };
 
 // A 32-bit word of the shared block by its byte offset (a constant).
 #define XENOS_SHARED_UINT(OFFSET) g_SharedConstants[(OFFSET) / 16][((OFFSET) % 16) / 4]
@@ -277,10 +278,18 @@ float3 getWeights2DArray(constant Texture2DArrayDescriptorHeap* textureHeap,
 
 #else
 
+#ifdef __spirv__
+// The draw's sampler slots, indexed by the shader's sampler register (a constant).
+[[vk::binding(3, 0)]] Texture2D<float4> g_Texture2DDescriptorHeap[16];
+[[vk::binding(4, 0)]] Texture2DArray<float4> g_Texture2DArrayDescriptorHeap[16];
+[[vk::binding(5, 0)]] TextureCube<float4> g_TextureCubeDescriptorHeap[16];
+[[vk::binding(6, 0)]] SamplerState g_SamplerDescriptorHeap[16];
+#else
 Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
 Texture2DArray<float4> g_Texture2DArrayDescriptorHeap[] : register(t0, space1);
 TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
 SamplerState g_SamplerDescriptorHeap[] : register(s0, space3);
+#endif
 
 #ifdef MARATHON_RECOMP
 RWStructuredBuffer<uint> g_ConditionalSurveyBuffer : register(u0, space4);

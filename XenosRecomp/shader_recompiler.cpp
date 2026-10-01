@@ -1570,12 +1570,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         {
             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
             {
-                println("#define {}_Texture{}DescriptorIndex XENOS_SHARED_UINT({})",
-                    constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
+                // The draw's descriptor set holds each sampler register's texture
+                // in the slot of that number.
+                println("#define {}_Texture{}DescriptorIndex {}",
+                    constantName, TEXTURE_DIMENSIONS[j], constantInfo->registerIndex.get());
             }
 
-            println("#define {}_SamplerDescriptorIndex XENOS_SHARED_UINT({})",
-                constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
+            println("#define {}_SamplerDescriptorIndex {}",
+                constantName, constantInfo->registerIndex.get());
 
             samplers.emplace(constantInfo->registerIndex, constantName);
             break;
