@@ -1505,7 +1505,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     // A register the constant table does not name - the literals a shader
     // defines, which Direct3D loads into the top of the constant bank when the
     // shader is set - is read straight from the bank by number.
-    println("#define XENOS_RAW_CONST(N) vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + (N) * 16, 0x10)",
+    println("#define XENOS_RAW_CONST(N) g_{}ShaderConstants[N]",
         isPixelShader ? "Pixel" : "Vertex");
 
 #ifdef UNLEASHED_RECOMP
@@ -1551,13 +1551,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             {
                 uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
 
-                println("#define {}(INDEX) selectWrapper((INDEX) < {}, vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10), 0.0)",
+                println("#define {}(INDEX) selectWrapper((INDEX) < {}, g_{}ShaderConstants[{} + min(INDEX, {})], 0.0)",
                     constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
             }
             else
             {
-                println("#define {} vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10)",
-                    constantName, shaderName, constantInfo->registerIndex * 16);
+                println("#define {} g_{}ShaderConstants[{}]",
+                    constantName, shaderName, constantInfo->registerIndex.get());
             }
             
             for (uint16_t j = 0; j < constantInfo->registerCount; j++)
@@ -1570,11 +1570,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         {
             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
             {
-                println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+                println("#define {}_Texture{}DescriptorIndex XENOS_SHARED_UINT({})",
                     constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
             }
 
-            println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+            println("#define {}_SamplerDescriptorIndex XENOS_SHARED_UINT({})",
                 constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
 
             samplers.emplace(constantInfo->registerIndex, constantName);

@@ -23,27 +23,29 @@
 
 #ifdef __spirv__
 
-struct PushConstants
-{
-    uint64_t VertexShaderConstants;
-    uint64_t PixelShaderConstants;
-    uint64_t SharedConstants;
-};
+// The constants come in three uniform buffers in set 4, each bound per draw at
+// its own offset: plain Vulkan 1.0, where reading them through a 64-bit buffer
+// address (vk::RawBufferLoad) needed bufferDeviceAddress and shaderInt64, which
+// the stock drivers of most phones do not have.
+[[vk::binding(0, 4)]] cbuffer XenosVertexConstants { float4 g_VertexShaderConstants[256]; };
+[[vk::binding(1, 4)]] cbuffer XenosPixelConstants { float4 g_PixelShaderConstants[256]; };
+[[vk::binding(2, 4)]] cbuffer XenosSharedConstants { uint4 g_SharedConstants[32]; };
 
-[[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
+// A 32-bit word of the shared block by its byte offset (a constant).
+#define XENOS_SHARED_UINT(OFFSET) g_SharedConstants[(OFFSET) / 16][((OFFSET) % 16) / 4]
 
-#define g_Booleans                  vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
-#define g_SwappedTexcoords          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
-#define g_SwappedNormals            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 264)
-#define g_SwappedBinormals          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 268)
-#define g_SwappedTangents           vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 272)
-#define g_SwappedBlendWeights       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 276)
-#define g_HalfPixelOffset           vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 280)
-#define g_ClipPlane                 vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 288)
-#define g_ClipPlaneEnabled          vk::RawBufferLoad<bool>(g_PushConstants.SharedConstants + 304)
-#define g_AlphaThreshold            vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 308)
-#define g_conditionalSurveyIndex    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 312)
-#define g_conditionalRenderingIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 316)
+#define g_Booleans                  XENOS_SHARED_UINT(256)
+#define g_SwappedTexcoords          XENOS_SHARED_UINT(260)
+#define g_SwappedNormals            XENOS_SHARED_UINT(264)
+#define g_SwappedBinormals          XENOS_SHARED_UINT(268)
+#define g_SwappedTangents           XENOS_SHARED_UINT(272)
+#define g_SwappedBlendWeights       XENOS_SHARED_UINT(276)
+#define g_HalfPixelOffset           asfloat(uint2(XENOS_SHARED_UINT(280), XENOS_SHARED_UINT(284)))
+#define g_ClipPlane                 asfloat(g_SharedConstants[18])
+#define g_ClipPlaneEnabled          (XENOS_SHARED_UINT(304) != 0)
+#define g_AlphaThreshold            asfloat(XENOS_SHARED_UINT(308))
+#define g_conditionalSurveyIndex    XENOS_SHARED_UINT(312)
+#define g_conditionalRenderingIndex XENOS_SHARED_UINT(316)
 
 [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
 
