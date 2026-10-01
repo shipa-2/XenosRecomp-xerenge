@@ -32,8 +32,14 @@
 [[vk::binding(1, 0)]] cbuffer XenosPixelConstants { float4 g_PixelShaderConstants[256]; };
 [[vk::binding(2, 0)]] cbuffer XenosSharedConstants { uint4 g_SharedConstants[32]; };
 
-// A 32-bit word of the shared block by its byte offset (a constant).
-#define XENOS_SHARED_UINT(OFFSET) g_SharedConstants[(OFFSET) / 16][((OFFSET) % 16) / 4]
+// A 32-bit word of the shared block by its byte offset (a constant). The whole
+// uint4 is loaded and the word picked from the value: an access chain down to
+// one component of a vector in a uniform buffer crashed Mali's shader compiler.
+uint XenosComponent(uint4 v, uint c)
+{
+    return c == 0 ? v.x : (c == 1 ? v.y : (c == 2 ? v.z : v.w));
+}
+#define XENOS_SHARED_UINT(OFFSET) XenosComponent(g_SharedConstants[(OFFSET) / 16], ((OFFSET) % 16) / 4)
 
 #define g_Booleans                  XENOS_SHARED_UINT(256)
 #define g_SwappedTexcoords          XENOS_SHARED_UINT(260)
