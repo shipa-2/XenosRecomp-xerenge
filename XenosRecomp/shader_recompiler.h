@@ -66,6 +66,12 @@ struct ShaderRecompiler : StringBuffer
     uint32_t aluIndex = 0;
     // The ALU instruction being written puts its vector result in half.
     bool vectorDestHalf = false;
+    // Its operands that are not half already go into half locals first,
+    // declared ahead of the statement: cast where they stand, DXC leaves the
+    // operation undecorated (a dot of two casts stays full precision).
+    bool collectHalfTemps = false;
+    std::vector<std::string> halfTemps;
+    uint32_t halfTempCount = 0;
     bool IsHalfRegister(uint32_t reg) const
     {
         return halfPrecision && reg < 64 && ((preciseRegisters >> reg) & 1) == 0;

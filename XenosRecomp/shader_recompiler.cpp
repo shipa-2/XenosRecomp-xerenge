@@ -705,12 +705,15 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             if (abs)
                 opResult.expression += ")";
 
-            if (vectorDestHalf && (operand == VECTOR_0 || operand == VECTOR_1 || operand == VECTOR_2) &&
+            if (vectorDestHalf && collectHalfTemps &&
+                (operand == VECTOR_0 || operand == VECTOR_1 || operand == VECTOR_2) &&
                 (!select || !IsHalfRegister(uint32_t(reg))))
             {
-                opResult.expression = opResult.componentCount > 1
-                    ? fmt::format("min16float{}({})", opResult.componentCount, opResult.expression)
-                    : fmt::format("min16float({})", opResult.expression);
+                const std::string name = fmt::format("h{}", halfTempCount++);
+                halfTemps.push_back(opResult.componentCount > 1
+                    ? fmt::format("min16float{} {} = {};", opResult.componentCount, name, opResult.expression)
+                    : fmt::format("min16float {} = {};", name, opResult.expression));
+                opResult.expression = name;
             }
 
             return opResult;
@@ -847,6 +850,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
     if (vectorWriteMask != 0)
     {
+        const size_t statementStart = out.size();
+        halfTemps.clear();
+        collectHalfTemps = vectorDestHalf;
         indent();
         if (!exportRegister.empty())
         {
@@ -1119,6 +1125,24 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             out += ')';
 
         out += ";\n";
+
+        collectHalfTemps = false;
+        if (!halfTemps.empty())
+        {
+            // In a block of their own: a declaration straight under a case
+            // label (control flow written as a switch) would not compile.
+            std::string declarations(indentation, '\t');
+            declarations += "{\n";
+            for (const std::string& temp : halfTemps)
+            {
+                declarations.append(indentation, '\t');
+                declarations += temp;
+                declarations += '\n';
+            }
+            out.insert(statementStart, declarations);
+            indent();
+            out += "}\n";
+        }
     }
 
     if (instr.scalarOpcode != AluScalarOpcode::RetainPrev)
@@ -2631,6 +2655,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     halfPrecision = isPixelShader && std::getenv("XENOSRECOMP_FULL_PRECISION") == nullptr;
     aluIndex = 0;
     aluHalf.clear();
+    halfTempCount = 0;
     if (halfPrecision)
     {
         analyzePrecision(reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + shader->physicalOffset), shader->size);
