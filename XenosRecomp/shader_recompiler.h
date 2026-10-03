@@ -51,6 +51,27 @@ struct ShaderRecompiler : StringBuffer
             out += '\t';
     }
 
+    // Pixel shaders in half precision where it is safe (min16float, which
+    // SPIR-V carries as RelaxedPrecision: mobile GPUs run it at twice the rate).
+    // A temporary stays full precision when it reaches a texture coordinate,
+    // the depth output or the address register, directly or through the
+    // registers computed from it; the rest - colour, lighting, fog - goes to
+    // half. XENOSRECOMP_FULL_PRECISION=1 keeps every shader as it was.
+    bool halfPrecision = false;
+    uint64_t preciseRegisters = 0;
+    // Per ALU instruction, in the order they are written: whether its vector
+    // result is computed in half (analyzePrecision), and which one is next.
+    std::string halfReason;
+    std::vector<uint8_t> aluHalf;
+    uint32_t aluIndex = 0;
+    // The ALU instruction being written puts its vector result in half.
+    bool vectorDestHalf = false;
+    bool IsHalfRegister(uint32_t reg) const
+    {
+        return halfPrecision && reg < 64 && ((preciseRegisters >> reg) & 1) == 0;
+    }
+    void analyzePrecision(const be<uint32_t>* code, uint32_t instrSize);
+
     uint32_t printDstSwizzle(uint32_t dstSwizzle, bool operand);
     void printDstSwizzle01(uint32_t dstRegister, uint32_t dstSwizzle);
 

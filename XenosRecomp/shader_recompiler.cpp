@@ -496,6 +496,12 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
 
 void ShaderRecompiler::recompile(const AluInstruction& instr)
 {
+    // A vector result kept in half: its operands are taken in half as well, or
+    // one full-precision constant would carry the whole operation back to full.
+    const uint32_t ordinal = aluIndex++;
+    vectorDestHalf = halfPrecision && !instr.vectorDestRelative && ordinal < aluHalf.size() &&
+                     aluHalf[ordinal] != 0;
+
     if (instr.isPredicated)
     {
         indent();
@@ -699,6 +705,14 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             if (abs)
                 opResult.expression += ")";
 
+            if (vectorDestHalf && (operand == VECTOR_0 || operand == VECTOR_1 || operand == VECTOR_2) &&
+                (!select || !IsHalfRegister(uint32_t(reg))))
+            {
+                opResult.expression = opResult.componentCount > 1
+                    ? fmt::format("min16float{}({})", opResult.componentCount, opResult.expression)
+                    : fmt::format("min16float({})", opResult.expression);
+            }
+
             return opResult;
         };
 
@@ -859,10 +873,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
         out += " = ";
 
+        const char* const resultType = vectorDestHalf ? "min16float" : "float";
         if (vectorWriteSize > 1)
-            print("(float{})((", vectorWriteSize);
+            print("({}{})((", resultType, vectorWriteSize);
         else
-            out += "(float)((";
+            print("({})((", resultType);
 
         if (instr.vectorSaturate)
             out += "saturate(";
@@ -1397,6 +1412,466 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         --indentation;
         indent();
         out += "}\n";
+    }
+}
+
+// Which values of a pixel shader may be computed in half (see halfPrecision).
+//
+// Each write is a value of its own: an ALU instruction's vector result may be
+// computed in half unless something reads it that needs full precision - a
+// texture coordinate, the depth output, render targets 1-3 (this title's
+// motion vectors), the address register - directly or through further values
+// computed from it. Registers are reused (r0 holds a coordinate early on and a
+// colour later), so this goes by value and by component: what reads a value
+// is every later instruction reading that component, up to an unconditional
+// write of it - in a shader without branches or conditional blocks; in one
+// with them every later read counts, and with a loop (or a jump back) every
+// read anywhere, since the code runs back. Declarations go by register: a
+// temporary none of whose values must be full is declared in half.
+void ShaderRecompiler::analyzePrecision(const be<uint32_t>* code, uint32_t instrSize)
+{
+    preciseRegisters = 0;
+    aluHalf.clear();
+    bool giveUp = false;
+    uint32_t giveUpBits = 0;
+    bool hasLoop = false;
+    bool straightLine = true;
+
+    struct Access
+    {
+        uint8_t reg;
+        uint8_t mask;  // components
+    };
+    struct Instr
+    {
+        bool alu = false;
+        bool predicated = false;
+        std::vector<Access> vectorReads;  // the vector unit's, or a fetch's coordinates
+        std::vector<Access> scalarReads;
+        Access vectorWrite{0, 0};         // a temporary written (mask 0: none)
+        Access scalarWrite{0, 0};
+        bool needsFull = false;           // its vector reads must be full
+        bool scalarToFull = false;        // its scalar result goes somewhere full
+        bool colourExport = false;        // its vector result goes to render target 0
+        bool readsPs = false;             // its scalar operation takes the previous one's result
+        uint32_t aluOrdinal = 0;
+    };
+    std::vector<Instr> instrs;
+    uint32_t aluCount = 0;
+
+    auto checkRegister = [&](uint32_t reg)
+        {
+            // Indexed by the loop counter: which register it is is not known
+            // here, so nothing in this shader is narrowed.
+            if (reg & 0x40)
+            {
+                giveUp = true;
+                giveUpBits |= 0x40;
+            }
+            return uint8_t(reg & 0x3F);
+        };
+
+    struct ControlFlowWords
+    {
+        uint32_t code0;
+        uint32_t code1;
+        uint32_t code2;
+        uint32_t code3;
+    };
+
+    union
+    {
+        ControlFlowInstruction controlFlow[2];
+        ControlFlowWords words;
+    };
+
+    auto controlFlowCode = code;
+    uint32_t instrAddress = 0;
+
+    // The control flow ends where the first block of instructions starts - as
+    // the writer finds it; read on, the instructions were taken for control
+    // flow, and their words for jumps (a loop where there was none) and blocks.
+    while (instrAddress < instrSize)
+    {
+        words.code0 = controlFlowCode[0];
+        words.code1 = controlFlowCode[1] & 0xFFFF;
+        words.code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
+        words.code3 = controlFlowCode[2] >> 16;
+
+        for (auto& cfInstr : controlFlow)
+        {
+            uint32_t address = 0;
+            switch (cfInstr.opcode)
+            {
+            case ControlFlowOpcode::Exec:
+            case ControlFlowOpcode::ExecEnd:
+                address = cfInstr.exec.address;
+                break;
+            case ControlFlowOpcode::CondExec:
+            case ControlFlowOpcode::CondExecEnd:
+            case ControlFlowOpcode::CondExecPredClean:
+            case ControlFlowOpcode::CondExecPredCleanEnd:
+                address = cfInstr.condExec.address;
+                break;
+            case ControlFlowOpcode::CondExecPred:
+            case ControlFlowOpcode::CondExecPredEnd:
+                address = cfInstr.condExecPred.address;
+                break;
+            default:
+                break;
+            }
+            if (address != 0)
+                instrSize = std::min<uint32_t>(instrSize, address * 12);
+        }
+
+        controlFlowCode += 3;
+        instrAddress += 12;
+    }
+
+    controlFlowCode = code;
+    instrAddress = 0;
+
+    while (instrAddress < instrSize)
+    {
+        words.code0 = controlFlowCode[0];
+        words.code1 = controlFlowCode[1] & 0xFFFF;
+        words.code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
+        words.code3 = controlFlowCode[2] >> 16;
+
+        for (auto& cfInstr : controlFlow)
+        {
+            uint32_t address = 0;
+            uint32_t count = 0;
+            uint32_t sequence = 0;
+
+            switch (cfInstr.opcode)
+            {
+            case ControlFlowOpcode::Exec:
+            case ControlFlowOpcode::ExecEnd:
+                address = cfInstr.exec.address;
+                count = cfInstr.exec.count;
+                sequence = cfInstr.exec.sequence;
+                break;
+            case ControlFlowOpcode::CondExec:
+            case ControlFlowOpcode::CondExecEnd:
+            case ControlFlowOpcode::CondExecPredClean:
+            case ControlFlowOpcode::CondExecPredCleanEnd:
+                address = cfInstr.condExec.address;
+                count = cfInstr.condExec.count;
+                sequence = cfInstr.condExec.sequence;
+                straightLine = false;
+                break;
+            case ControlFlowOpcode::CondExecPred:
+            case ControlFlowOpcode::CondExecPredEnd:
+                address = cfInstr.condExecPred.address;
+                count = cfInstr.condExecPred.count;
+                sequence = cfInstr.condExecPred.sequence;
+                straightLine = false;
+                break;
+            case ControlFlowOpcode::LoopStart:
+                hasLoop = true;
+                straightLine = false;
+                break;
+            case ControlFlowOpcode::CondJmp:
+                straightLine = false;
+                // Back to an earlier block: as good as a loop.
+                if (cfInstr.condJmp.isUnconditional || cfInstr.condJmp.direction)
+                    hasLoop = true;
+                break;
+            default:
+                break;
+            }
+
+            auto instructionCode = code + address * 3;
+
+            for (uint32_t i = 0; i < count; i++)
+            {
+                struct InstructionWords
+                {
+                    uint32_t code0;
+                    uint32_t code1;
+                    uint32_t code2;
+                };
+
+                union
+                {
+                    VertexFetchInstruction vertexFetch;
+                    TextureFetchInstruction textureFetch;
+                    AluInstruction alu;
+                    InstructionWords instructionWords;
+                };
+
+                instructionWords.code0 = instructionCode[0];
+                instructionWords.code1 = instructionCode[1];
+                instructionWords.code2 = instructionCode[2];
+
+                Instr instr;
+                if ((sequence & 0x1) != 0)
+                {
+                    if (vertexFetch.opcode != FetchOpcode::VertexFetch &&
+                        (textureFetch.opcode == FetchOpcode::TextureFetch ||
+                         textureFetch.opcode == FetchOpcode::GetTextureWeights))
+                    {
+                        if (textureFetch.srcRegisterAm || textureFetch.dstRegisterAm)
+                        {
+                            giveUp = true;
+                            giveUpBits |= 0x100;
+                        }
+                        instr.predicated = textureFetch.isPredicated;
+                        uint32_t components = 2;
+                        switch (textureFetch.dimension)
+                        {
+                        case TextureDimension::Texture1D: components = 1; break;
+                        case TextureDimension::Texture2D: components = 2; break;
+                        default: components = 3; break;
+                        }
+                        uint8_t mask = 0;
+                        for (uint32_t c = 0; c < components; c++)
+                            mask |= uint8_t(1) << ((textureFetch.srcSwizzle >> (c * 2)) & 0x3);
+                        instr.vectorReads.push_back({ uint8_t(textureFetch.srcRegister), mask });
+                        // Coordinates into a 1D or 2D texture - screen-sized ones,
+                        // where half precision is off by half a texel near 1.0 -
+                        // stay full. Into a volume (this title's colour grading
+                        // table, 16-32 a side) or a cube (a direction, the
+                        // reflection's 128 a face) half is ample.
+                        instr.needsFull = textureFetch.dimension == TextureDimension::Texture1D ||
+                                          textureFetch.dimension == TextureDimension::Texture2D;
+                        uint8_t written = 0;
+                        for (uint32_t c = 0; c < 4; c++)
+                        {
+                            if (getDestSwizzle(textureFetch.dstSwizzle, c) != FetchDestinationSwizzle::Keep)
+                                written |= uint8_t(1) << c;
+                        }
+                        instr.vectorWrite = { uint8_t(textureFetch.dstRegister), written };
+                    }
+                }
+                else
+                {
+                    instr.alu = true;
+                    instr.aluOrdinal = aluCount++;
+                    instr.predicated = alu.isPredicated;
+
+                    // The components each vector operand is read at, as the
+                    // writer reads them (op() in recompile).
+                    const AluVectorOpcode vectorOpcode = alu.vectorOpcode;
+                    const uint32_t vectorWriteMask = alu.vectorWriteMask;
+                    auto vectorOperand = [&](uint32_t reg, uint32_t swizzle, bool select, bool third)
+                        {
+                            if (!select)
+                                return;
+                            uint32_t mask;
+                            switch (vectorOpcode)
+                            {
+                            case AluVectorOpcode::Dp2Add:
+                                mask = third ? 0b1 : 0b11;
+                                break;
+                            case AluVectorOpcode::Dp3:
+                                mask = 0b111;
+                                break;
+                            case AluVectorOpcode::Dp4:
+                            case AluVectorOpcode::Max4:
+                                mask = 0b1111;
+                                break;
+                            default:
+                                mask = vectorWriteMask != 0 ? vectorWriteMask : 0b1;
+                                break;
+                            }
+                            uint8_t read = 0;
+                            for (uint32_t c = 0; c < 4; c++)
+                            {
+                                if ((mask >> c) & 1)
+                                    read |= uint8_t(1) << (((swizzle >> (c * 2)) + c) & 0x3);
+                            }
+                            instr.vectorReads.push_back({ checkRegister(reg), read });
+                        };
+                    vectorOperand(alu.src1Register, alu.src1Swizzle, alu.src1Select, false);
+                    vectorOperand(alu.src2Register, alu.src2Swizzle, alu.src2Select, false);
+                    vectorOperand(alu.src3Register, alu.src3Swizzle, alu.src3Select, true);
+                    // The scalar operand: the register a constant form names
+                    // (SCALAR_CONSTANT_1), or the third source at either
+                    // component it may take. Which operations take ps - the
+                    // previous scalar result - is what carries a need for full
+                    // precision from one scalar operation back to the one before.
+                    const AluScalarOpcode scalarOpcode = alu.scalarOpcode;
+                    const bool constantForm =
+                        scalarOpcode == AluScalarOpcode::Mulsc0 || scalarOpcode == AluScalarOpcode::Mulsc1 ||
+                        scalarOpcode == AluScalarOpcode::Addsc0 || scalarOpcode == AluScalarOpcode::Addsc1 ||
+                        scalarOpcode == AluScalarOpcode::Subsc0 || scalarOpcode == AluScalarOpcode::Subsc1;
+                    if (constantForm)
+                    {
+                        const uint32_t reg =
+                            (uint32_t(alu.scalarOpcode) & 1) | (alu.src3Select << 1) | (alu.src3Swizzle & 0x3C);
+                        instr.scalarReads.push_back({ uint8_t(reg & 0x3F), uint8_t(1u << (alu.src3Swizzle & 0x3)) });
+                    }
+                    else if (alu.src3Select)
+                    {
+                        const uint8_t mask = uint8_t((1u << (((alu.src3Swizzle >> 6) + 3) & 0x3)) |
+                                                     (1u << (alu.src3Swizzle & 0x3)));
+                        instr.scalarReads.push_back({ checkRegister(alu.src3Register), mask });
+                    }
+                    instr.readsPs =
+                        scalarOpcode == AluScalarOpcode::AddsPrev || scalarOpcode == AluScalarOpcode::MulsPrev ||
+                        scalarOpcode == AluScalarOpcode::MulsPrev2 || scalarOpcode == AluScalarOpcode::SubsPrev ||
+                        scalarOpcode == AluScalarOpcode::SetpEq || scalarOpcode == AluScalarOpcode::SetpNe ||
+                        scalarOpcode == AluScalarOpcode::SetpGt || scalarOpcode == AluScalarOpcode::SetpGe ||
+                        scalarOpcode == AluScalarOpcode::SetpInv || scalarOpcode == AluScalarOpcode::SetpPop ||
+                        scalarOpcode == AluScalarOpcode::SetpClr || scalarOpcode == AluScalarOpcode::SetpRstr;
+                    // The address register, from a scalar result.
+                    if (scalarOpcode == AluScalarOpcode::MaxAs || scalarOpcode == AluScalarOpcode::MaxAsf)
+                        instr.scalarToFull = true;
+
+                    if (alu.vectorOpcode >= AluVectorOpcode::MaxA)
+                        instr.needsFull = true;
+                    if (alu.exportData)
+                    {
+                        // Render targets 1-3 and depth: this title writes its motion
+                        // vectors into target 1, the difference of two positions in
+                        // clip space - hundreds, apart by fractions - which half
+                        // precision turns to noise. Only the colour target is narrowed.
+                        const ExportRegister exported = ExportRegister(alu.vectorDest);
+                        if (exported == ExportRegister::PSColor1 || exported == ExportRegister::PSColor2 ||
+                            exported == ExportRegister::PSColor3 || exported == ExportRegister::PSDepth)
+                        {
+                            instr.needsFull = true;
+                            instr.scalarToFull = alu.scalarWriteMask != 0;
+                        }
+                        // The colour itself: an eight- or ten-bit target, which half
+                        // precision holds whole.
+                        instr.colourExport = exported == ExportRegister::PSColor0 && !instr.needsFull;
+                    }
+                    else
+                    {
+                        if (alu.vectorDestRelative || alu.scalarDestRelative)
+                        {
+                            giveUp = true;
+                            giveUpBits |= 0x200;
+                        }
+                        if (alu.vectorWriteMask != 0)
+                            instr.vectorWrite = { uint8_t(alu.vectorDest), uint8_t(alu.vectorWriteMask) };
+                        if (alu.scalarWriteMask != 0)
+                            instr.scalarWrite = { uint8_t(alu.scalarDest), uint8_t(alu.scalarWriteMask) };
+                    }
+                }
+                instrs.push_back(std::move(instr));
+
+                sequence >>= 2;
+                instructionCode += 3;
+            }
+        }
+
+        controlFlowCode += 3;
+        instrAddress += 12;
+    }
+
+    const size_t n = instrs.size();
+    // Whether each instruction's vector result and scalar result must be full.
+    std::vector<uint8_t> vectorFull(n, 0), scalarFull(n, 0);
+    for (size_t i = 0; i < n; i++)
+    {
+        if (instrs[i].scalarToFull)
+            scalarFull[i] = 1;
+    }
+
+    // Is the value instruction `from` wrote (from -1: the register's starting
+    // value) into `reg`, components `mask`, read for something full?
+    auto readFull = [&](ptrdiff_t from, uint8_t reg, uint8_t mask) -> bool
+        {
+            uint8_t live = mask;
+            for (size_t j = 0; j < n && live != 0; j++)
+            {
+                if (ptrdiff_t(j) == from || (!hasLoop && ptrdiff_t(j) < from))
+                    continue;
+                const Instr& r = instrs[j];
+                const bool vectorUseFull = r.needsFull || (r.alu && vectorFull[j]);
+                for (const Access& a : r.vectorReads)
+                {
+                    if (a.reg == reg && (a.mask & live) && vectorUseFull)
+                        return true;
+                }
+                for (const Access& a : r.scalarReads)
+                {
+                    if (a.reg == reg && (a.mask & live) && scalarFull[j])
+                        return true;
+                }
+                // Written again: later reads of those components read that.
+                if (straightLine && !hasLoop && !r.predicated && ptrdiff_t(j) > from)
+                {
+                    if (r.vectorWrite.mask && r.vectorWrite.reg == reg)
+                        live &= ~r.vectorWrite.mask;
+                    if (r.scalarWrite.mask && r.scalarWrite.reg == reg)
+                        live &= ~r.scalarWrite.mask;
+                }
+            }
+            return false;
+        };
+
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (size_t i = n; i-- > 0;)
+        {
+            const Instr& instr = instrs[i];
+            if (!instr.alu)
+                continue;
+            if (!vectorFull[i] && instr.vectorWrite.mask &&
+                readFull(ptrdiff_t(i), instr.vectorWrite.reg, instr.vectorWrite.mask))
+            {
+                vectorFull[i] = 1;
+                changed = true;
+            }
+            // ps goes on to the next scalar operation too.
+            bool scalar = instr.scalarWrite.mask &&
+                          readFull(ptrdiff_t(i), instr.scalarWrite.reg, instr.scalarWrite.mask);
+            for (size_t j = i + 1; !scalar && j < n; j++)
+            {
+                if (instrs[j].alu)
+                {
+                    scalar = instrs[j].readsPs && scalarFull[j] != 0;
+                    break;
+                }
+            }
+            if (!scalarFull[i] && scalar)
+            {
+                scalarFull[i] = 1;
+                changed = true;
+            }
+        }
+    }
+
+    halfReason = giveUp ? fmt::format("off: indexed or relative registers ({:X})", giveUpBits)
+                        : fmt::format("on{}{}", hasLoop ? ", with a loop" : "",
+                                      straightLine ? ", straight-line" : "");
+    if (giveUp)
+    {
+        halfPrecision = false;
+        return;
+    }
+
+    aluHalf.assign(aluCount, 0);
+    for (size_t i = 0; i < n; i++)
+    {
+        const Instr& instr = instrs[i];
+        if (instr.alu)
+            aluHalf[instr.aluOrdinal] = (instr.vectorWrite.mask != 0 && !vectorFull[i]) || instr.colourExport;
+    }
+
+    // Declarations: a temporary is full if any value written to it is, or its
+    // starting value (an interpolator's) is read for something full.
+    for (uint8_t reg = 0; reg < 64; reg++)
+    {
+        bool full = readFull(-1, reg, 0xF);
+        for (size_t i = 0; i < n && !full; i++)
+        {
+            const Instr& instr = instrs[i];
+            if (instr.vectorWrite.mask && instr.vectorWrite.reg == reg)
+                full = instr.alu ? vectorFull[i] != 0
+                                 : readFull(ptrdiff_t(i), reg, instr.vectorWrite.mask);
+            if (!full && instr.scalarWrite.mask && instr.scalarWrite.reg == reg)
+                full = scalarFull[i] != 0;
+        }
+        if (full)
+            preciseRegisters |= uint64_t(1) << reg;
     }
 }
 
@@ -2152,6 +2627,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\n";
     }
 
+    // Which temporaries go to half precision (pixel shaders only).
+    halfPrecision = isPixelShader && std::getenv("XENOSRECOMP_FULL_PRECISION") == nullptr;
+    aluIndex = 0;
+    aluHalf.clear();
+    if (halfPrecision)
+    {
+        analyzePrecision(reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + shader->physicalOffset), shader->size);
+        // The pixel's own position stays full.
+        const uint32_t positionRegister = (shader->fieldC >> 8) & 0xFF;
+        if (positionRegister < 64)
+            preciseRegisters |= uint64_t(1) << positionRegister;
+    }
+    if (isPixelShader)
+        println("\t// half precision: {}", halfPrecision ? halfReason : std::string("off"));
+
     bool printedRegisters[32]{};
 
     uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
@@ -2167,7 +2657,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         if (isPixelShader)
         {
             value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
-            println("\tfloat4 r{} = input.i{};", uint32_t(interpolator.reg), shaderInterpolatorNames[i]);
+            println("\t{} r{} = input.i{};", IsHalfRegister(interpolator.reg) ? "min16float4" : "float4",
+                uint32_t(interpolator.reg), shaderInterpolatorNames[i]);
             printedRegisters[interpolator.reg] = true;
         }
         else
@@ -2195,7 +2686,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     {
         if (!printedRegisters[i])
         {
-            print("\tfloat4 r{} = ", i);
+            print("\t{} r{} = ", IsHalfRegister(uint32_t(i)) ? "min16float4" : "float4", i);
             if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
             {
                 out += "float4((input.iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
