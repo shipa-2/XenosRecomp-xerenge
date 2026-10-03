@@ -3,6 +3,8 @@
 
 #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
 #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
+// Burnout without bloom: the composite's bloom term from the pixel itself.
+#define SPEC_CONSTANT_BLOOM_IN_PLACE    (1 << 6)
 
 #ifdef UNLEASHED_RECOMP
     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)

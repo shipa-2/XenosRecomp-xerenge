@@ -401,6 +401,52 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     }
 #endif
 
+    // Burnout's composite without bloom (SPEC_CONSTANT_BLOOM_IN_PLACE): the
+    // bloom term taken from this pixel of the scene instead of the blurred
+    // quarter-resolution buffer - what the bloom chain settles at over an even
+    // area (bright pass 2s*x - y, taps z * 0.816 + the centre's 0.184 - its own
+    // weight, gBloomParams.w, is set by the table bloom-off skips - 10% kept
+    // from the frame before), with no blur, no halo and no trail. Without the term
+    // the bright sky lost what lifts it past the colour table's blue.
+    bool bloomInPlace = false;
+    std::string bloomScene;
+    if (isPixelShader && hasBloomParams && instr.opcode == FetchOpcode::TextureFetch &&
+        instr.dimension == TextureDimension::Texture2D &&
+        strcmp(constNamePtr, "gBloomAccumulation") == 0)
+    {
+        for (const auto& [index, name] : samplers)
+        {
+            if (strcmp(name, "gSceneSampler") == 0)
+                bloomInPlace = true;
+        }
+    }
+    if (bloomInPlace)
+    {
+        bloomScene = fmt::format("bloomScene{}", bloomInPlaceCount++);
+        indent();
+        println("float3 {} = 0.0;", bloomScene);
+        indent();
+        println("if (g_SpecConstants() & SPEC_CONSTANT_BLOOM_IN_PLACE)");
+        indent();
+        out += "{\n";
+        ++indentation;
+        indent();
+        println("{} = tfetch2D(", bloomScene);
+        println("#ifdef __air__");
+        indent();
+        println("\tg_Texture2DDescriptorHeap,");
+        indent();
+        println("\tg_SamplerDescriptorHeap,");
+        println("#endif");
+        indent();
+        print("\tgSceneSampler_Texture2DDescriptorIndex, gSceneSampler_SamplerDescriptorIndex, ");
+        printSrcRegister(2);
+        out += ", float2(0, 0)).xyz;\n";
+        --indentation;
+        indent();
+        out += "}\n";
+    }
+
     indent();
     print("r{}.", instr.dstRegister);
     printDstSwizzle(instr.dstSwizzle, false);
@@ -485,6 +531,27 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     out += ";\n";
 
     printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
+
+    if (bloomInPlace)
+    {
+        indent();
+        println("if (g_SpecConstants() & SPEC_CONSTANT_BLOOM_IN_PLACE)");
+        indent();
+        out += "{\n";
+        ++indentation;
+        indent();
+        println("float4 bloomValue = float4(saturate(saturate({} * (2.0 * gBloomParams.x) - gBloomParams.y) * "
+                "((gBloomParams.z * 0.816 + 0.184) / 0.9)), 0.0);", bloomScene);
+        indent();
+        print("r{}.", instr.dstRegister);
+        printDstSwizzle(instr.dstSwizzle, false);
+        out += " = bloomValue.";
+        printDstSwizzle(instr.dstSwizzle, true);
+        out += ";\n";
+        --indentation;
+        indent();
+        out += "}\n";
+    }
 
     if (instr.isPredicated)
     {
@@ -2059,6 +2126,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     constantName, shaderName, constantInfo->registerIndex.get());
             }
             
+            if (strcmp(constantName, "gBloomParams") == 0)
+                hasBloomParams = true;
+
             for (uint16_t j = 0; j < constantInfo->registerCount; j++)
                 float4Constants.emplace(constantInfo->registerIndex + j, constantInfo);
 

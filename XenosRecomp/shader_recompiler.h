@@ -39,6 +39,10 @@ struct ShaderRecompiler : StringBuffer
     // puts in r0.x (Burnout's gNumVertices shaders). The host hands that index
     // in as an input, since what it draws is already expanded.
     bool guestIndexInput = false;
+    // Burnout's bloom: the shader declares gBloomParams (its composite reads the
+    // bloom from gBloomAccumulation, see the texture fetch).
+    bool hasBloomParams = false;
+    uint32_t bloomInPlaceCount = 0;
 
 #ifdef UNLEASHED_RECOMP
     bool hasMtxProjection = false;
