@@ -59,6 +59,10 @@ IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixe
 
     args[argCount++] = L"-Qstrip_debug";
 
+    // The stage, for what only one of them can do (shader_common.h: a texture
+    // fetch with the level of detail from the derivatives).
+    args[argCount++] = compilePixelShader ? L"-DXENOS_PIXEL_SHADER" : L"-DXENOS_VERTEX_SHADER";
+
 #ifdef UNLEASHED_RECOMP
     args[argCount++] = L"-DUNLEASHED_RECOMP";
 #endif
