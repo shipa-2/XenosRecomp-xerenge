@@ -536,7 +536,12 @@ float4 tfetchR11G11B10(uint4 value)
 
 float4 swapFloats(uint swappedFloats, float4 value, uint semanticIndex)
 {
-    return (swappedFloats & (1ull << semanticIndex)) != 0 ? value.yxwz : value;
+    // A select, not ?: - DXC turns a ternary over a vector into a branch and a
+    // phi, and the Adreno 5xx compiler (Redmi Note 7) lost every vertex of the
+    // shaders that call this: the cars vanished. 1u rather than 1ull keeps it
+    // off 64-bit integers, which those GPUs and old Mali lack.
+    const bool swapped = (swappedFloats & (1u << semanticIndex)) != 0;
+    return selectWrapper(bool4(swapped, swapped, swapped, swapped), value.yxwz, value);
 }
 
 float4 dst(float4 src0, float4 src1)
